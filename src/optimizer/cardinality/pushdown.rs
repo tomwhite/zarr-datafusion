@@ -161,6 +161,16 @@ fn date_part_periodic(
     Some((axis, period))
 }
 
+/// The field of a periodic `date_part` group key, such as `hour`, lowercased.
+pub(crate) fn date_part_field(expr: &Arc<dyn PhysicalExpr>) -> Option<String> {
+    let sf = expr.downcast_ref::<ScalarFunctionExpr>()?;
+    if sf.fun().name() != "date_part" {
+        return None;
+    }
+    let field = literal_str(sf.args().first()?)?.to_ascii_lowercase();
+    period_of(&field).map(|_| field)
+}
+
 /// The string value of a UTF-8 literal expression, if it is one.
 fn literal_str(expr: &Arc<dyn PhysicalExpr>) -> Option<String> {
     match expr.downcast_ref::<Literal>()?.value() {
@@ -174,16 +184,23 @@ fn literal_str(expr: &Arc<dyn PhysicalExpr>) -> Option<String> {
 /// The period (max distinct values) of a `date_part` field, or `None` if the field
 /// is unbounded (`year`) or unrecognized.
 fn period_of(field: &str) -> Option<u64> {
+    let (first, last) = field_range(field)?;
+    Some((last - first + 1) as u64)
+}
+
+/// The first and last values of a periodic `date_part` field, as DataFusion
+/// numbers them.
+pub(crate) fn field_range(field: &str) -> Option<(i64, i64)> {
     Some(match field.to_ascii_lowercase().as_str() {
-        "month" => 12,
-        "day" => 31,
-        "hour" => 24,
-        "minute" => 60,
-        "second" => 60,
-        "quarter" => 4,
-        "doy" | "dayofyear" => 366,
-        "dow" | "dayofweek" => 7,
-        "week" => 53,
+        "month" => (1, 12),
+        "day" => (1, 31),
+        "hour" => (0, 23),
+        "minute" => (0, 59),
+        "second" => (0, 59),
+        "quarter" => (1, 4),
+        "doy" | "dayofyear" => (1, 366),
+        "dow" | "dayofweek" => (0, 6),
+        "week" => (1, 53),
         _ => return None,
     })
 }

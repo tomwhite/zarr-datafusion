@@ -29,6 +29,7 @@ use zarrs::filesystem::FilesystemStore;
 
 use datafusion::physical_plan::ExecutionPlan;
 
+use crate::optimizer::cardinality::pushdown::field_range;
 use crate::reader::filter::{CoordSelection, CoordValuesRef};
 use crate::reader::filter::calculate_coord_ranges;
 
@@ -137,19 +138,26 @@ pub fn materialize_spec(
         None => None,
     };
 
-    // Build the target grid axes, gathered by selection where present.
+    // Build the target grid axes, gathered by selection where present. A periodic
+    // axis spans its field's whole range, whatever the selection.
     let grid_coords: Vec<CoordSpec> = shape
         .grid_axis_source
         .iter()
         .zip(&shape.grid_axes)
-        .map(|(&src, name)| {
-            let values = match &selections {
-                Some(sels) => gather(&coords[src], &sels[src]),
-                None => coords[src].clone(),
+        .zip(&shape.grid_axis_field)
+        .map(|((&src, name), field)| {
+            let values = match (field, &selections) {
+                (Some(field), _) => {
+                    let (first, last) = field_range(field)
+                        .ok_or_else(|| format!("'{field}' is not a periodic date_part"))?;
+                    CoordValues::Int64((first..=last).collect())
+                }
+                (None, Some(sels)) => gather(&coords[src], &sels[src]),
+                (None, None) => coords[src].clone(),
             };
-            CoordSpec::new(name.clone(), values)
+            Ok(CoordSpec::new(name.clone(), values))
         })
-        .collect();
+        .collect::<Result<_, BoxError>>()?;
 
     let data_vars: Vec<DataVarSpec> = shape
         .data_vars
