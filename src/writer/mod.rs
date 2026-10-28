@@ -21,4 +21,4 @@ pub use plan::{derive_write_shape, RejectReason, WriteShape, WriteVar};
 pub use skeleton::{
     create_skeleton, CoordSpec, CoordValues, DataVarSpec, SkeletonSpec, WriteDataType,
 };
-pub use sink::{write_batches, write_batches_partitioned};
+pub use sink::{write_batches, write_batches_partitioned, write_chunks};

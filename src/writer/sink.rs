@@ -34,6 +34,7 @@
 //!   sink writes the *whole* region including the holes, so the hole value it writes
 //!   must equal the array's declared fill, and it only knows the defaults (0 / NaN).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{Array as _, Float32Array, Float64Array, Int64Array};
@@ -172,6 +173,72 @@ fn reject_custom_fills(spec: &SkeletonSpec) -> Result<(), BoxError> {
     Ok(())
 }
 
+/// A batch's coordinate columns, one per grid axis, cast to their axes' types.
+fn axis_columns<'a>(
+    batch: &RecordBatch,
+    spec: &'a SkeletonSpec,
+) -> Result<Vec<AxisCol<'a>>, BoxError> {
+    spec.coords
+        .iter()
+        .map(|c| match &c.values {
+            CoordValues::Int64(axis) => {
+                let arr = cast_to(batch, &c.name, &ArrowType::Int64)?;
+                let col = arr
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or("cast to Int64 did not yield Int64Array")?
+                    .clone();
+                Ok(AxisCol::I64 { col, axis })
+            }
+            CoordValues::Float64(axis) => {
+                let arr = cast_to(batch, &c.name, &ArrowType::Float64)?;
+                let col = arr
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or("cast to Float64 did not yield Float64Array")?
+                    .clone();
+                Ok(AxisCol::F64 { col, axis })
+            }
+        })
+        .collect()
+}
+
+/// A batch's data-variable columns, cast to their variables' types.
+fn var_columns(batch: &RecordBatch, spec: &SkeletonSpec) -> Result<Vec<VarCol>, BoxError> {
+    spec.data_vars
+        .iter()
+        .map(|v| match v.data_type {
+            WriteDataType::Int64 => {
+                let arr = cast_to(batch, &v.name, &ArrowType::Int64)?;
+                Ok(VarCol::I64(
+                    arr.as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or("cast to Int64 did not yield Int64Array")?
+                        .clone(),
+                ))
+            }
+            WriteDataType::Float32 => {
+                let arr = cast_to(batch, &v.name, &ArrowType::Float32)?;
+                Ok(VarCol::F32(
+                    arr.as_any()
+                        .downcast_ref::<Float32Array>()
+                        .ok_or("cast to Float32 did not yield Float32Array")?
+                        .clone(),
+                ))
+            }
+            WriteDataType::Float64 => {
+                let arr = cast_to(batch, &v.name, &ArrowType::Float64)?;
+                Ok(VarCol::F64(
+                    arr.as_any()
+                        .downcast_ref::<Float64Array>()
+                        .ok_or("cast to Float64 did not yield Float64Array")?
+                        .clone(),
+                ))
+            }
+        })
+        .collect()
+}
+
 /// Write the rows whose outer-axis (axis 0) index falls in `[outer_start,
 /// outer_end)` into that chunk-aligned slab of the target.
 ///
@@ -210,64 +277,8 @@ fn write_range(
     for batch in batches {
         let n = batch.num_rows();
 
-        let axis_cols: Vec<AxisCol> = spec
-            .coords
-            .iter()
-            .map(|c| match &c.values {
-                CoordValues::Int64(axis) => {
-                    let arr = cast_to(batch, &c.name, &ArrowType::Int64)?;
-                    let col = arr
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .ok_or("cast to Int64 did not yield Int64Array")?
-                        .clone();
-                    Ok(AxisCol::I64 { col, axis })
-                }
-                CoordValues::Float64(axis) => {
-                    let arr = cast_to(batch, &c.name, &ArrowType::Float64)?;
-                    let col = arr
-                        .as_any()
-                        .downcast_ref::<Float64Array>()
-                        .ok_or("cast to Float64 did not yield Float64Array")?
-                        .clone();
-                    Ok(AxisCol::F64 { col, axis })
-                }
-            })
-            .collect::<Result<_, BoxError>>()?;
-
-        let var_cols: Vec<VarCol> = spec
-            .data_vars
-            .iter()
-            .map(|v| match v.data_type {
-                WriteDataType::Int64 => {
-                    let arr = cast_to(batch, &v.name, &ArrowType::Int64)?;
-                    Ok(VarCol::I64(
-                        arr.as_any()
-                            .downcast_ref::<Int64Array>()
-                            .ok_or("cast to Int64 did not yield Int64Array")?
-                            .clone(),
-                    ))
-                }
-                WriteDataType::Float32 => {
-                    let arr = cast_to(batch, &v.name, &ArrowType::Float32)?;
-                    Ok(VarCol::F32(
-                        arr.as_any()
-                            .downcast_ref::<Float32Array>()
-                            .ok_or("cast to Float32 did not yield Float32Array")?
-                            .clone(),
-                    ))
-                }
-                WriteDataType::Float64 => {
-                    let arr = cast_to(batch, &v.name, &ArrowType::Float64)?;
-                    Ok(VarCol::F64(
-                        arr.as_any()
-                            .downcast_ref::<Float64Array>()
-                            .ok_or("cast to Float64 did not yield Float64Array")?
-                            .clone(),
-                    ))
-                }
-            })
-            .collect::<Result<_, BoxError>>()?;
+        let axis_cols = axis_columns(batch, spec)?;
+        let var_cols = var_columns(batch, spec)?;
 
         for r in 0..n {
             // Resolve the outer index first, so rows outside this slab are cheaply
@@ -382,4 +393,91 @@ pub fn write_batches_partitioned(
         "sink wrote data variables (partitioned)"
     );
     Ok(total)
+}
+
+/// Write the chunks `batches`' rows fall in into an existing skeleton, each chunk
+/// whole: its cells without a row take the fill value. Chunks no row falls in are
+/// left as they are, so writers whose rows fall in different chunks can fill one
+/// store between them; two writing the same chunk would each erase the other's
+/// cells. Returns the number of rows written.
+pub fn write_chunks(
+    store_path: &str,
+    spec: &SkeletonSpec,
+    batches: impl IntoIterator<Item = RecordBatch>,
+) -> Result<u64, BoxError> {
+    reject_custom_fills(spec)?;
+    let shape: Vec<usize> = spec.coords.iter().map(|c| c.values.len()).collect();
+    let chunk: Vec<usize> = spec.chunks.iter().map(|&c| c as usize).collect();
+    // A chunk at the end of an axis is cut short by it.
+    let extent = |index: &[usize]| -> Vec<usize> {
+        index
+            .iter()
+            .zip(&chunk)
+            .zip(&shape)
+            .map(|((&i, &c), &s)| c.min(s - i * c))
+            .collect()
+    };
+
+    let mut touched: BTreeMap<Vec<usize>, Vec<Buffer>> = BTreeMap::new();
+    let mut rows_written = 0u64;
+    for batch in batches {
+        let axis_cols = axis_columns(&batch, spec)?;
+        let var_cols = var_columns(&batch, spec)?;
+        for r in 0..batch.num_rows() {
+            let at = axis_cols
+                .iter()
+                .zip(&spec.coords)
+                .map(|(ac, c)| ac.index_at(&c.name, r))
+                .collect::<Result<Vec<_>, _>>()?;
+            let index: Vec<usize> = at.iter().zip(&chunk).map(|(&i, &c)| i / c).collect();
+            let size = extent(&index);
+            let mut pos = 0;
+            for ((&i, &c), &n) in at.iter().zip(&chunk).zip(&size) {
+                pos = pos * n + i % c;
+            }
+            let buffers = touched.entry(index).or_insert_with(|| {
+                let cells = size.iter().product();
+                spec.data_vars
+                    .iter()
+                    .map(|v| Buffer::filled(v.data_type, cells))
+                    .collect()
+            });
+            for (vc, buf) in var_cols.iter().zip(buffers.iter_mut()) {
+                vc.scatter(r, buf, pos);
+            }
+            rows_written += 1;
+        }
+    }
+
+    let store = Arc::new(FilesystemStore::new(store_path)?);
+    let arrays: Vec<Array<FilesystemStore>> = spec
+        .data_vars
+        .iter()
+        .map(|v| Array::open(store.clone(), &format!("/{}", v.name)))
+        .collect::<Result<_, _>>()?;
+    let chunks_written = touched.len();
+    for (index, buffers) in touched {
+        let ranges: Vec<std::ops::Range<u64>> = index
+            .iter()
+            .zip(&chunk)
+            .zip(extent(&index))
+            .map(|((&i, &c), n)| (i * c) as u64..(i * c + n) as u64)
+            .collect();
+        let subset = ArraySubset::new_with_ranges(&ranges);
+        for (v, (array, buf)) in arrays.iter().zip(buffers).enumerate() {
+            match buf {
+                Buffer::I64(b) => array.store_array_subset(&subset, b.as_slice()),
+                Buffer::F32(b) => array.store_array_subset(&subset, b.as_slice()),
+                Buffer::F64(b) => array.store_array_subset(&subset, b.as_slice()),
+            }
+            .map_err(|e| format!("store '{}': {e}", spec.data_vars[v].name))?;
+        }
+    }
+    info!(
+        store_path,
+        rows = rows_written,
+        chunks = chunks_written,
+        "sink wrote chunks"
+    );
+    Ok(rows_written)
 }
