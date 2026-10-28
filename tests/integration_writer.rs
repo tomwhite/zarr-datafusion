@@ -580,3 +580,18 @@ async fn a_chunk_writer_fills_the_rest_of_its_chunks_and_leaves_others() {
     let before = scalar_i64(&ctx, &at(2, 6, 7)).await;
     assert_eq!(before, cell(2, 6, 7), "another chunk is kept");
 }
+
+#[tokio::test]
+async fn sink_places_rows_on_a_descending_axis() {
+    // Latitude often runs from north to south.
+    let mut spec = rt_spec();
+    spec.coords[1] = CoordSpec::new("lat", CoordValues::Int64((0..NLAT).rev().collect()));
+    let path = scratch("descending.zarr");
+    create_skeleton(&path, &spec).unwrap();
+    write_batches(&path, &spec, [grid_batch(|_, _, _| true)]).unwrap();
+
+    let ctx = create_test_context();
+    register_zarr_table(&ctx, "t", &path);
+    let at = "SELECT temperature FROM t WHERE time=2 AND lat=3 AND lon=7";
+    assert_eq!(scalar_i64(&ctx, at).await, cell(2, 3, 7));
+}

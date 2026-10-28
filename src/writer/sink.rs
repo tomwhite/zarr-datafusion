@@ -86,22 +86,40 @@ impl AxisCol<'_> {
                     return Err(format!("null value in coordinate column '{name}'").into());
                 }
                 let v = col.value(r);
-                axis.binary_search(&v)
-                    .map_err(|_| format!("value {v} in column '{name}' is not on axis '{name}'").into())
+                let found = if descending(axis) {
+                    axis.binary_search_by(|a| v.cmp(a))
+                } else {
+                    axis.binary_search(&v)
+                };
+                found.map_err(|_| {
+                    format!("value {v} in column '{name}' is not on axis '{name}'").into()
+                })
             }
             AxisCol::F64 { col, axis } => {
                 if col.is_null(r) {
                     return Err(format!("null value in coordinate column '{name}'").into());
                 }
                 let v = col.value(r);
+                let reverse = descending(axis);
                 axis.binary_search_by(|a| {
-                    a.partial_cmp(&v)
-                        .expect("axis and coordinate values are non-NaN")
+                    let order = a
+                        .partial_cmp(&v)
+                        .expect("axis and coordinate values are non-NaN");
+                    if reverse {
+                        order.reverse()
+                    } else {
+                        order
+                    }
                 })
                 .map_err(|_| format!("value {v} in column '{name}' is not on axis '{name}'").into())
             }
         }
     }
+}
+
+/// Whether an axis's values run from high to low, as latitude often does.
+fn descending<T: PartialOrd>(axis: &[T]) -> bool {
+    axis.first() > axis.last()
 }
 
 /// One data-variable column of a batch, cast to the variable's element type.
