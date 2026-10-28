@@ -581,6 +581,41 @@ async fn a_chunk_writer_fills_the_rest_of_its_chunks_and_leaves_others() {
     assert_eq!(before, cell(2, 6, 7), "another chunk is kept");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn writers_write_through_an_object_store_url() {
+    let mono = scratch("url_mono.zarr");
+    create_skeleton(&mono, &rt_spec()).unwrap();
+    write_batches(&mono, &rt_spec(), [grid_batch(|_, _, _| true)]).unwrap();
+
+    let chunks = scratch("url_chunks.zarr");
+    let parts = scratch("url_parts.zarr");
+    let urls = [&chunks, &parts].map(|p| format!("file://{p}"));
+    tokio::task::spawn_blocking(move || {
+        let [chunks, parts] = &urls;
+        create_skeleton(chunks, &rt_spec()).unwrap();
+        for y0 in (0..NLAT).step_by(4) {
+            let tile = grid_batch(|_, y, _| y / 4 == y0 / 4);
+            write_chunks(chunks, &rt_spec(), [tile]).unwrap();
+        }
+        create_skeleton(parts, &rt_spec()).unwrap();
+        write_batches_partitioned(parts, &rt_spec(), [grid_batch(|_, _, _| true)], 3).unwrap();
+    })
+    .await
+    .unwrap();
+
+    for path in [&chunks, &parts] {
+        for var in ["temperature", "reflectance"] {
+            assert!(
+                nan_aware_eq(
+                    &read_all_f64(path, var).await,
+                    &read_all_f64(&mono, var).await
+                ),
+                "{var} in {path} differs from a local write's",
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn sink_places_rows_on_a_descending_axis() {
     // Latitude often runs from north to south.

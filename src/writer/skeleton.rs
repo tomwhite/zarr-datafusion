@@ -27,9 +27,10 @@ use zarrs::array::codec::bytes_to_bytes::blosc::{
 };
 use zarrs::array::codec::BloscCodec;
 use zarrs::array::{ArrayBuilder, DataType, FillValue};
-use zarrs::filesystem::FilesystemStore;
 use zarrs::group::GroupBuilder;
 use tracing::{debug, info};
+
+use super::store::open_target;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -308,7 +309,7 @@ fn blosc(type_size: usize) -> Result<BloscCodec, BoxError> {
 pub fn create_skeleton(store_path: &str, spec: &SkeletonSpec) -> Result<(), BoxError> {
     spec.validate()?;
 
-    let store = Arc::new(FilesystemStore::new(store_path)?);
+    let store = open_target(store_path)?;
     let shape = spec.shape();
     let dimension_names = spec.dimension_names();
 

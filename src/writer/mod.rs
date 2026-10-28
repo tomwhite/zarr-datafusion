@@ -13,6 +13,7 @@ pub mod materialize;
 pub mod plan;
 pub mod skeleton;
 pub mod sink;
+mod store;
 
 pub use copy_format::{register_zarr_write_format, ZarrFileFormat, ZarrFormatFactory};
 pub use data_sink::{zarr_write_exec, ZarrDataSink};

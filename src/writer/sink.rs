@@ -35,7 +35,6 @@
 //!   must equal the array's declared fill, and it only knows the defaults (0 / NaN).
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use arrow::array::{Array as _, Float32Array, Float64Array, Int64Array};
 use arrow::compute::cast;
@@ -44,10 +43,11 @@ use arrow::record_batch::RecordBatch;
 use tracing::{debug, info};
 use zarrs::array::Array;
 use zarrs::array::ArraySubset;
-use zarrs::filesystem::FilesystemStore;
+use zarrs::storage::{ReadableWritableListableStorage, ReadableWritableListableStorageTraits};
 
 use crate::physical_plan::partition::plan_partitions;
 use super::skeleton::{CoordValues, SkeletonSpec, WriteDataType};
+use super::store::open_target;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -266,7 +266,7 @@ fn var_columns(batch: &RecordBatch, spec: &SkeletonSpec) -> Result<Vec<VarCol>, 
 /// concurrently (§5.4). Rows outside the range are ignored, so every partition can
 /// see the same input and take only its share.
 fn write_range(
-    store_path: &str,
+    store: &ReadableWritableListableStorage,
     spec: &SkeletonSpec,
     shape: &[usize],
     strides: &[usize],
@@ -278,13 +278,12 @@ fn write_range(
     let slab_rows = (outer_end - outer_start) * outer_stride;
     let base = outer_start * outer_stride;
 
-    let store = Arc::new(FilesystemStore::new(store_path)?);
     let mut buffers: Vec<Buffer> = spec
         .data_vars
         .iter()
         .map(|v| Buffer::filled(v.data_type, slab_rows))
         .collect();
-    let arrays: Vec<Array<FilesystemStore>> = spec
+    let arrays: Vec<Array<dyn ReadableWritableListableStorageTraits>> = spec
         .data_vars
         .iter()
         .map(|v| Array::open(store.clone(), &format!("/{}", v.name)))
@@ -333,7 +332,7 @@ fn write_range(
         }
         .map_err(|e| format!("store '{}': {e}", spec.data_vars[v].name))?;
     }
-    debug!(store_path, outer_start, outer_end, rows_written, "slab written");
+    debug!(outer_start, outer_end, rows_written, "slab written");
     Ok(rows_written)
 }
 
@@ -352,7 +351,8 @@ pub fn write_batches(
     let shape: Vec<usize> = spec.coords.iter().map(|c| c.values.len()).collect();
     let strides = row_major_strides(&shape);
     let batches: Vec<RecordBatch> = batches.into_iter().collect();
-    let n = write_range(store_path, spec, &shape, &strides, &batches, 0, shape[0])?;
+    let store = open_target(store_path)?;
+    let n = write_range(&store, spec, &shape, &strides, &batches, 0, shape[0])?;
     info!(store_path, rows = n, "sink wrote data variables");
     Ok(n)
 }
@@ -377,6 +377,7 @@ pub fn write_batches_partitioned(
     let strides = row_major_strides(&shape);
     let batches: Vec<RecordBatch> = batches.into_iter().collect();
 
+    let store = open_target(store_path)?;
     let ranges: Vec<(usize, usize)> = plan_partitions(shape[0] as u64, spec.chunks[0], target_partitions)
         .iter()
         .filter_map(|p| p.as_range())
@@ -387,9 +388,10 @@ pub fn write_batches_partitioned(
         let handles: Vec<_> = ranges
             .iter()
             .map(|&(a, b)| {
-                let (spec, shape, strides, batches) = (spec, &shape, &strides, &batches);
+                let (store, spec, shape, strides, batches) =
+                    (&store, spec, &shape, &strides, &batches);
                 scope.spawn(move || {
-                    write_range(store_path, spec, shape, strides, batches, a, b)
+                    write_range(store, spec, shape, strides, batches, a, b)
                         .map_err(|e| e.to_string())
                 })
             })
@@ -467,8 +469,8 @@ pub fn write_chunks(
         }
     }
 
-    let store = Arc::new(FilesystemStore::new(store_path)?);
-    let arrays: Vec<Array<FilesystemStore>> = spec
+    let store = open_target(store_path)?;
+    let arrays: Vec<Array<dyn ReadableWritableListableStorageTraits>> = spec
         .data_vars
         .iter()
         .map(|v| Array::open(store.clone(), &format!("/{}", v.name)))
