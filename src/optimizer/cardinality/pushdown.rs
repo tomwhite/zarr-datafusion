@@ -138,7 +138,8 @@ fn column_axis(expr: &Arc<dyn PhysicalExpr>, coord_axis: &HashMap<&str, usize>) 
     coord_axis.get(col.name()).copied()
 }
 
-/// A group key of the form `date_part('<field>', <coord>)` → `(axis, period)`, where
+/// A group key of the form `date_part('<field>', <coord>)`, `<coord>` perhaps cast,
+/// → `(axis, period)`, where
 /// `period` bounds the distinct values (month→12, hour→24, …). `year` and unknown
 /// fields are *not* periodic and decline.
 fn date_part_periodic(
@@ -154,8 +155,9 @@ fn date_part_periodic(
         return None;
     }
     let period = period_of(&literal_str(&args[0])?)?;
-    let col = args[1].downcast_ref::<Column>()?;
-    let axis = coord_axis.get(col.name()).copied()?;
+    // Through a cast: `date_part` refuses a dictionary-encoded time unless cast.
+    let column = bare_column(&args[1])?;
+    let axis = coord_axis.get(column.as_str()).copied()?;
     Some((axis, period))
 }
 
