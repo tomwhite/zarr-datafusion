@@ -39,7 +39,7 @@ use datafusion::physical_plan::expressions::Column;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::ExecutionPlan;
 
-use crate::optimizer::cardinality::pushdown::{date_part_field, recognize};
+use crate::optimizer::cardinality::pushdown::{date_part_field, recognize_for_write};
 use crate::optimizer::cardinality::GroupKey;
 use crate::physical_plan::zarr_exec::ZarrExec;
 
@@ -67,6 +67,9 @@ pub struct WriteShape {
     /// For a grid axis that is a periodic function of its source axis, the
     /// `date_part` field (`hour`, `month`, …), in the same order as `grid_axes`.
     pub grid_axis_field: Vec<Option<String>>,
+    /// For a grid axis that truncates its source axis, the `date_trunc` unit
+    /// (`month`, `day`, …), in the same order as `grid_axes`.
+    pub grid_axis_trunc: Vec<Option<String>>,
     /// Data variables to write.
     pub data_vars: Vec<WriteVar>,
     /// True when the write reduces the source cube (the plan has a `GROUP BY`);
@@ -209,9 +212,10 @@ pub fn derive_write_shape(
 
     // A reduce's grid axes, one per group key, each named by the output column it
     // reaches, in source dimension order.
-    let mut keys: Vec<(usize, String, Option<String>)> = Vec::new();
+    let mut keys: Vec<(usize, String, Option<String>, Option<String>)> = Vec::new();
     if let Some(agg) = maybe_agg {
-        let cand = recognize(agg, zarr).ok_or(RejectReason::UnpushableAggregate)?;
+        let (cand, truncated) =
+            recognize_for_write(agg, zarr).ok_or(RejectReason::UnpushableAggregate)?;
         if cand.group_keys.is_empty() {
             return Err(RejectReason::ScalarAggregate);
         }
@@ -227,16 +231,16 @@ pub fn derive_write_shape(
                 GroupKey::Axis(_) => None,
                 GroupKey::Periodic { .. } => date_part_field(&exprs[k].0),
             };
-            keys.push((key.axis(), name, field));
+            keys.push((key.axis(), name, field, truncated[k].clone()));
         }
         // The coordinate list follows the store's listing, not the data's dimensions.
         let dims = meta.data_vars.first().and_then(|v| v.dimensions.as_ref());
-        keys.sort_by_key(|(axis, _, _)| {
+        keys.sort_by_key(|(axis, _, _, _)| {
             dims.and_then(|d| d.iter().position(|n| *n == axis_names[*axis]))
                 .unwrap_or(*axis)
         });
     }
-    let is_key = |name: &str| keys.iter().any(|(_, key, _)| key == name);
+    let is_key = |name: &str| keys.iter().any(|(_, key, _, _)| key == name);
 
     // Every output column that is not a coordinate (a source one, or a group key)
     // is a data variable to write. Its element type is the widened Arrow type
@@ -267,19 +271,15 @@ pub fn derive_write_shape(
     }
 
     if maybe_agg.is_some() {
-        let (grid_axis_source, grid_axes, grid_axis_field) = keys.into_iter().fold(
-            (Vec::new(), Vec::new(), Vec::new()),
-            |(mut sources, mut names, mut fields), (source, name, field)| {
-                sources.push(source);
-                names.push(name);
-                fields.push(field);
-                (sources, names, fields)
-            },
-        );
+        let grid_axis_source = keys.iter().map(|k| k.0).collect();
+        let grid_axes = keys.iter().map(|k| k.1.clone()).collect();
+        let grid_axis_field = keys.iter().map(|k| k.2.clone()).collect();
+        let grid_axis_trunc = keys.into_iter().map(|k| k.3).collect();
         return Ok(WriteShape {
             grid_axes,
             grid_axis_source,
             grid_axis_field,
+            grid_axis_trunc,
             data_vars,
             is_reduce: true,
         });
@@ -303,6 +303,7 @@ pub fn derive_write_shape(
         grid_axes: axis_names.iter().map(|a| a.to_string()).collect(),
         grid_axis_source: (0..axis_names.len()).collect(),
         grid_axis_field: vec![None; axis_names.len()],
+        grid_axis_trunc: vec![None; axis_names.len()],
         data_vars,
         is_reduce: false,
     })
