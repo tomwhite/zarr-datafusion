@@ -613,3 +613,51 @@ async fn copy_to_writes_a_cf_time_axis_that_reads_back_as_the_same_times() {
         pairs(&ctx, "SELECT time, AVG(temperature) FROM t GROUP BY time").await,
     );
 }
+
+#[tokio::test]
+async fn copy_to_writes_a_truncated_time_as_an_axis_of_its_own() {
+    // time is stored as days since 2020-01-15, mid-month, over six months of 2020
+    let ctx = ctx_over_monthly();
+    register_zarr_write_format(&ctx).expect("register format");
+    for (unit, groups) in [("month", 6), ("year", 1)] {
+        let key = format!("date_trunc('{unit}', CAST(time AS TIMESTAMP))");
+        let query = format!(
+            "SELECT {key} AS {unit}, lat, lon, AVG(temperature) AS mean FROM t \
+             GROUP BY {key}, lat, lon"
+        );
+        let target = scratch(&format!("copyto_trunc_{unit}.zarr"));
+        ctx.sql(&format!("COPY ({query}) TO '{target}' STORED AS ZARR"))
+            .await
+            .expect("plan COPY")
+            .collect()
+            .await
+            .expect("run COPY");
+
+        let meta = std::fs::read_to_string(format!("{target}/{unit}/zarr.json")).unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&meta).unwrap();
+        // the source's units, 12:00 on the 15th, can't place a month's start
+        assert_eq!(
+            meta["attributes"]["units"], "days since 1970-01-01",
+            "{unit}"
+        );
+        assert_eq!(
+            meta["attributes"]["calendar"], "proleptic_gregorian",
+            "{unit}"
+        );
+        let tgt = create_baseline_context();
+        register_zarr_table(&tgt, "c", &target);
+        let written = pairs(
+            &tgt,
+            &format!("SELECT CAST({unit} AS TIMESTAMP), mean FROM c"),
+        )
+        .await;
+        let expected = pairs(
+            &ctx,
+            &format!("SELECT {key}, AVG(temperature) FROM t GROUP BY {key}, lat, lon"),
+        )
+        .await;
+        assert_eq!(written, expected, "{unit}");
+        let distinct: std::collections::BTreeSet<i64> = written.iter().map(|(k, _)| *k).collect();
+        assert_eq!(distinct.len(), groups, "{unit}");
+    }
+}

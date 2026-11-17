@@ -22,6 +22,8 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, Timelike};
+
 use zarrs::array::Array;
 use zarrs::array::ArraySubset;
 use zarrs::storage::AsyncReadableListableStorage;
@@ -29,7 +31,7 @@ use zarrs_object_store::object_store::path::Path as ObjectPath;
 
 use datafusion::physical_plan::ExecutionPlan;
 
-use crate::optimizer::cardinality::pushdown::field_range;
+use crate::optimizer::cardinality::pushdown::{field_range, truncation_units};
 use crate::reader::cf_time::apply_cf_time_conversion;
 use crate::reader::coord::CoordValues as ReadCoordValues;
 use crate::reader::filter::calculate_coord_ranges;
@@ -169,7 +171,16 @@ pub async fn materialize_spec(
         .iter()
         .zip(&shape.grid_axes)
         .zip(&shape.grid_axis_field)
-        .map(|((&src, name), field)| {
+        .zip(&shape.grid_axis_trunc)
+        .map(|(((&src, name), field), trunc)| {
+            if let Some(unit) = trunc {
+                let selected = match &selections {
+                    Some(sels) => gather(&coords[src], &sels[src]),
+                    None => coords[src].clone(),
+                };
+                let source = &meta.coords[src];
+                return truncated_axis(name, &as_read(&selected, source), unit, source);
+            }
             let values = match (field, &selections) {
                 (Some(field), _) => {
                     let (first, last) = field_range(field)
@@ -203,6 +214,69 @@ pub async fn materialize_spec(
         .collect();
 
     Ok(SkeletonSpec::new(grid_coords, data_vars, chunks))
+}
+
+/// An axis of the distinct truncations to `unit` of a CF time's `values`, in
+/// order, in units each truncation is a whole number of, with the source's
+/// calendar.
+fn truncated_axis(
+    name: &str,
+    values: &ReadCoordValues,
+    unit: &str,
+    source: &ZarrArrayMeta,
+) -> Result<CoordSpec, BoxError> {
+    let ReadCoordValues::TimestampMicros(times) = values else {
+        let name = &source.name;
+        return Err(format!("'{name}' truncates to '{unit}' but isn't a CF time").into());
+    };
+    let units = truncation_units(unit).ok_or_else(|| format!("can't write a '{unit}' axis"))?;
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .expect("the epoch");
+    let mut axis: Vec<i64> = Vec::new();
+    for &us in times {
+        let time = DateTime::from_timestamp_micros(us)
+            .ok_or_else(|| format!("time {us} is out of range"))?
+            .naive_utc();
+        let since = truncate(time, unit)? - epoch;
+        let n = if units.starts_with("hours") {
+            since.num_hours()
+        } else {
+            since.num_days()
+        };
+        if axis.last() != Some(&n) {
+            axis.push(n);
+        }
+    }
+    axis.sort_unstable();
+    axis.dedup();
+    let mut coord = CoordSpec::new(name, CoordValues::Int64(axis));
+    coord.attributes.insert("units".into(), units.into());
+    let calendar = source
+        .cf_time_attrs
+        .as_ref()
+        .and_then(|cf| cf.calendar.clone());
+    let calendar = calendar.unwrap_or_else(|| "proleptic_gregorian".into());
+    coord.attributes.insert("calendar".into(), calendar.into());
+    Ok(coord)
+}
+
+/// `time` truncated to the start of its `unit`, as DataFusion's `date_trunc` does.
+fn truncate(time: NaiveDateTime, unit: &str) -> Result<NaiveDateTime, BoxError> {
+    let date = time.date();
+    let start = match unit {
+        "year" => NaiveDate::from_ymd_opt(date.year(), 1, 1),
+        "quarter" => NaiveDate::from_ymd_opt(date.year(), (date.month0() / 3) * 3 + 1, 1),
+        "month" => NaiveDate::from_ymd_opt(date.year(), date.month(), 1),
+        "week" => Some(date - Duration::days(i64::from(date.weekday().num_days_from_monday()))),
+        "day" => Some(date),
+        "hour" => return Ok(date.and_hms_opt(time.hour(), 0, 0).expect("an hour")),
+        _ => None,
+    };
+    Ok(start
+        .ok_or_else(|| format!("can't truncate to '{unit}'"))?
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight"))
 }
 
 /// Convenience: derive the write's shape from `plan` and materialise it into a

@@ -63,6 +63,25 @@ pub struct PushdownCandidate {
 /// than `COUNT`), or a `GROUP BY` key isn't a bare coordinate column. Pure and
 /// side-effect-free — the caller decides what to do with a recognized candidate.
 pub fn recognize(agg: &AggregateExec, zarr: &ZarrExec) -> Option<PushdownCandidate> {
+    recognize_keys(agg, zarr, false).map(|(candidate, _)| candidate)
+}
+
+/// As [`recognize`], but a key may also truncate a coordinate, as
+/// `date_trunc('month', time)`, which a write can make an axis of but a pushdown
+/// can't compute. Such a key's [`GroupKey`] is the axis it truncates, and its unit
+/// comes back beside it.
+pub(crate) fn recognize_for_write(
+    agg: &AggregateExec,
+    zarr: &ZarrExec,
+) -> Option<(PushdownCandidate, Vec<Option<String>>)> {
+    recognize_keys(agg, zarr, true)
+}
+
+fn recognize_keys(
+    agg: &AggregateExec,
+    zarr: &ZarrExec,
+    truncations: bool,
+) -> Option<(PushdownCandidate, Vec<Option<String>>)> {
     let meta = zarr.store_meta()?;
     let coord_axis: HashMap<&str, usize> = meta
         .coords
@@ -114,22 +133,60 @@ pub fn recognize(agg: &AggregateExec, zarr: &ZarrExec) -> Option<PushdownCandida
     // of one, e.g. `date_part('month', time)` (→ Periodic). Anything else declines.
     let mut group_keys = Vec::new();
     let mut group_names = Vec::new();
+    let mut truncated = Vec::new();
     for (expr, name) in agg.group_expr().expr() {
-        let key = column_axis(expr, &coord_axis)
-            .map(GroupKey::Axis)
+        let (key, unit) = column_axis(expr, &coord_axis)
+            .map(|axis| (GroupKey::Axis(axis), None))
             .or_else(|| {
                 date_part_periodic(expr, &coord_axis)
-                    .map(|(axis, period)| GroupKey::Periodic { axis, period })
+                    .map(|(axis, period)| (GroupKey::Periodic { axis, period }, None))
+            })
+            .or_else(|| {
+                let (axis, unit) = date_trunc_axis(expr, &coord_axis).filter(|_| truncations)?;
+                Some((GroupKey::Axis(axis), Some(unit)))
             })?;
         group_keys.push(key);
         group_names.push(name.clone());
+        truncated.push(unit);
     }
 
-    Some(PushdownCandidate {
-        aggs,
-        group_keys,
-        group_names,
-    })
+    Some((
+        PushdownCandidate {
+            aggs,
+            group_keys,
+            group_names,
+        },
+        truncated,
+    ))
+}
+
+/// A group key of the form `date_trunc('<unit>', <coord>)`, `<coord>` perhaps
+/// cast, → `(axis, unit)`, for the units a truncated axis can be written in.
+fn date_trunc_axis(
+    expr: &Arc<dyn PhysicalExpr>,
+    coord_axis: &HashMap<&str, usize>,
+) -> Option<(usize, String)> {
+    let sf = expr.downcast_ref::<ScalarFunctionExpr>()?;
+    let [unit, time] = sf.args() else {
+        return None;
+    };
+    if sf.fun().name() != "date_trunc" {
+        return None;
+    }
+    let unit = literal_str(unit)?.to_ascii_lowercase();
+    truncation_units(&unit)?;
+    let axis = coord_axis.get(bare_column(time)?.as_str()).copied()?;
+    Some((axis, unit))
+}
+
+/// The CF units a time truncated to `unit` is written in, each truncation a
+/// whole number of them, or `None` for a unit a truncated axis can't be.
+pub(crate) fn truncation_units(unit: &str) -> Option<&'static str> {
+    match unit {
+        "year" | "quarter" | "month" | "week" | "day" => Some("days since 1970-01-01"),
+        "hour" => Some("hours since 1970-01-01"),
+        _ => None,
+    }
 }
 
 /// The cube axis of a group key that is a bare coordinate column.
